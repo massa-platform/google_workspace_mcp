@@ -7,6 +7,7 @@ This module provides MCP tools for interacting with the Gmail API.
 import logging
 import asyncio
 import base64
+import re
 import ssl
 import mimetypes
 from html.parser import HTMLParser
@@ -441,33 +442,74 @@ def _extract_headers(payload: dict, header_names: List[str]) -> Dict[str, str]:
     return headers
 
 
+def _parse_message_id_chain(header_value: Optional[str]) -> List[str]:
+    """Extract Message-IDs from a reply header value."""
+    if not header_value:
+        return []
 
-async def _fetch_thread_message_ids(service, thread_id: str) -> tuple[Optional[str], Optional[str]]:
+    message_ids = re.findall(r"<[^>]+>", header_value)
+    if message_ids:
+        return message_ids
+
+    return header_value.split()
+
+
+def _derive_reply_headers(
+    thread_message_ids: List[str],
+    in_reply_to: Optional[str],
+    references: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """Fill missing reply headers while preserving caller intent."""
+    derived_in_reply_to = in_reply_to
+    derived_references = references
+
+    if not thread_message_ids:
+        return derived_in_reply_to, derived_references
+
+    if not derived_in_reply_to:
+        reference_chain = _parse_message_id_chain(derived_references)
+        derived_in_reply_to = (
+            reference_chain[-1] if reference_chain else thread_message_ids[-1]
+        )
+
+    if not derived_references:
+        if derived_in_reply_to and derived_in_reply_to in thread_message_ids:
+            reply_index = thread_message_ids.index(derived_in_reply_to)
+            derived_references = " ".join(thread_message_ids[: reply_index + 1])
+        elif derived_in_reply_to:
+            derived_references = derived_in_reply_to
+        else:
+            derived_references = " ".join(thread_message_ids)
+
+    return derived_in_reply_to, derived_references
+
+
+async def _fetch_thread_message_ids(service, thread_id: str) -> List[str]:
     """
     Fetch Message-ID headers from a Gmail thread for reply threading.
-
-    Returns the last message's Message-ID (for In-Reply-To) and the full chain
-    of Message-IDs (for References).
 
     Args:
         service: Gmail API service instance
         thread_id: Gmail thread ID
 
     Returns:
-        Tuple of (last_message_id, references_chain) where both are strings or None
+        Message-IDs in thread order. Returns an empty list on failure.
     """
     try:
         thread = await asyncio.to_thread(
-            service.users().threads().get(
+            service.users()
+            .threads()
+            .get(
                 userId="me",
                 id=thread_id,
                 format="metadata",
                 metadataHeaders=["Message-ID"],
-            ).execute
+            )
+            .execute
         )
         messages = thread.get("messages", [])
         if not messages:
-            return None, None
+            return []
 
         # Collect all Message-IDs in thread order
         message_ids = []
@@ -477,15 +519,12 @@ async def _fetch_thread_message_ids(service, thread_id: str) -> tuple[Optional[s
             if mid:
                 message_ids.append(mid)
 
-        if not message_ids:
-            return None, None
-
-        last_message_id = message_ids[-1]
-        references_chain = " ".join(message_ids)
-        return last_message_id, references_chain
+        return message_ids
     except Exception as e:
-        logger.warning(f"Failed to fetch thread Message-IDs for thread {thread_id}: {e}")
-        return None, None
+        logger.warning(
+            f"Failed to fetch thread Message-IDs for thread {thread_id}: {e}"
+        )
+        return []
 
 
 def _prepare_gmail_message(
@@ -1695,13 +1734,10 @@ async def draft_gmail_message(
     # Auto-populate In-Reply-To and References when thread_id is provided
     # but headers are missing, to ensure the draft renders inline in Gmail
     if thread_id and (not in_reply_to or not references):
-        fetched_reply_to, fetched_references = await _fetch_thread_message_ids(
-            service, thread_id
+        thread_message_ids = await _fetch_thread_message_ids(service, thread_id)
+        in_reply_to, references = _derive_reply_headers(
+            thread_message_ids, in_reply_to, references
         )
-        if not in_reply_to and fetched_reply_to:
-            in_reply_to = fetched_reply_to
-        if not references and fetched_references:
-            references = fetched_references
 
     raw_message, thread_id_final, attached_count = _prepare_gmail_message(
         subject=subject,
