@@ -1,4 +1,6 @@
+import base64
 import io
+import json
 import logging
 import os
 import zipfile
@@ -7,8 +9,9 @@ import asyncio
 import functools
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Annotated, Any, List, Optional
 
+from pydantic import BeforeValidator
 from defusedxml import ElementTree as ET
 
 from googleapiclient.errors import HttpError
@@ -29,6 +32,63 @@ class UserInputError(Exception):
     """Raised for user-facing input/validation errors that shouldn't be retried."""
 
     pass
+
+
+def _coerce_json_str_to_type(v: Any, expected_type: type) -> Any:
+    """Coerce a JSON-encoded string to a specific container type."""
+    if not isinstance(v, str):
+        return v
+
+    try:
+        parsed = json.loads(v)
+    except (json.JSONDecodeError, TypeError):
+        return v
+
+    return parsed if isinstance(parsed, expected_type) else v
+
+
+def _coerce_json_str_to_list(v: Any) -> Any:
+    """Coerce a JSON-encoded string to a list.
+
+    Some MCP clients (e.g. Cowork) serialise array parameters as JSON strings
+    rather than native arrays.  This ``BeforeValidator`` transparently converts
+    ``'["a","b"]'`` → ``["a", "b"]`` so Pydantic validation succeeds.
+    """
+    return _coerce_json_str_to_type(v, list)
+
+
+StringList = Annotated[List[str], BeforeValidator(_coerce_json_str_to_list)]
+"""``List[str]`` that also accepts a JSON-encoded string of an array.
+
+Use in tool signatures instead of ``List[str]`` to work around MCP clients
+that send ``'["value"]'`` instead of ``["value"]``.
+"""
+
+
+DictList = Annotated[List[dict[str, Any]], BeforeValidator(_coerce_json_str_to_list)]
+"""``List[dict]`` that also accepts a JSON-encoded string of an array.
+
+Use in tool signatures instead of ``List[dict]`` to work around MCP clients
+that send ``'[{"key":"val"}]'`` instead of ``[{"key":"val"}]``.
+"""
+
+
+def _coerce_json_str_to_dict(v: Any) -> Any:
+    """Coerce a JSON-encoded string to a dict.
+
+    Some MCP clients serialise dict parameters as JSON strings rather than
+    native objects.  This ``BeforeValidator`` transparently converts
+    ``'{"key":"val"}'`` -> ``{"key": "val"}`` so Pydantic validation succeeds.
+    """
+    return _coerce_json_str_to_type(v, dict)
+
+
+JsonDict = Annotated[dict[str, Any], BeforeValidator(_coerce_json_str_to_dict)]
+"""``dict`` that also accepts a JSON-encoded string of an object.
+
+Use in tool signatures instead of ``Dict[str, Any]`` to work around MCP clients
+that send ``'{"key":"val"}'`` instead of ``{"key": "val"}``.
+"""
 
 
 # Directories from which local file reads are allowed.
@@ -371,6 +431,62 @@ def extract_office_xml_text(file_bytes: bytes, mime_type: str) -> Optional[str]:
             f"Failed to extract office XML text for {mime_type}: {e}", exc_info=True
         )
         return None
+
+
+IMAGE_MIME_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+    "image/tiff",
+    "image/svg+xml",
+}
+
+
+def extract_pdf_text(file_bytes: bytes) -> Optional[str]:
+    """
+    Extract text from a PDF using pypdf.
+    Returns plain text with pages separated by double newlines, or None on failure.
+    """
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(file_bytes))
+        pages = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                pages.append(text)
+        if not pages:
+            return None
+        return "\n\n".join(pages).strip() or None
+    except Exception as e:
+        logger.warning(f"Failed to extract PDF text: {e}")
+        return None
+
+
+def encode_image_content(file_bytes: bytes, mime_type: str) -> str:
+    """
+    Base64-encode image bytes with a mime type metadata prefix.
+
+    Args:
+        file_bytes: The image file content as bytes.
+        mime_type: The MIME type of the image (must start with "image/").
+
+    Returns:
+        str: Base64-encoded image with mime type prefix.
+
+    Raises:
+        ValueError: If mime_type is not an image MIME type.
+    """
+    if not mime_type.startswith("image/"):
+        raise ValueError(
+            f"Expected image/* MIME type, got '{mime_type}'. "
+            "Only image content can be base64-encoded for multimodal clients."
+        )
+    encoded = base64.b64encode(file_bytes).decode("ascii")
+    return f"[base64_image:{mime_type}]{encoded}"
 
 
 def handle_http_errors(

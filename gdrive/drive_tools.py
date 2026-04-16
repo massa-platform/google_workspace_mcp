@@ -25,7 +25,14 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from auth.service_decorator import require_google_service
 from auth.oauth_config import is_stateless_mode
 from core.attachment_storage import get_attachment_storage, get_attachment_url
-from core.utils import extract_office_xml_text, handle_http_errors, validate_file_path
+from core.utils import (
+    IMAGE_MIME_TYPES,
+    encode_image_content,
+    extract_office_xml_text,
+    extract_pdf_text,
+    handle_http_errors,
+    validate_file_path,
+)
 from core.server import server
 from core.config import get_transport_mode
 from gdrive.drive_helpers import (
@@ -64,6 +71,7 @@ async def search_drive_files(
     corpora: Optional[str] = None,
     file_type: Optional[str] = None,
     detailed: bool = True,
+    order_by: Optional[str] = None,
 ) -> str:
     """
     Searches for files and folders within a user's Google Drive, including shared drives.
@@ -71,6 +79,10 @@ async def search_drive_files(
     Args:
         user_google_email (str): The user's Google email address. Required.
         query (str): The search query string. Supports Google Drive search operators.
+                     NOTE: Owner-based queries ('user@example.com' in owners) DO NOT WORK in Shared Drives
+                     because files are owned by the shared drive itself, not individual users.
+                     For recent files by a specific user in Shared Drives, search by modifiedTime
+                     and use order_by='modifiedTime desc' instead.
         page_size (int): The maximum number of files to return. Defaults to 10.
         page_token (Optional[str]): Page token from a previous response's nextPageToken to retrieve the next page of results.
         drive_id (Optional[str]): ID of the shared drive to search. If None, behavior depends on `corpora` and `include_items_from_all_drives`.
@@ -84,6 +96,11 @@ async def search_drive_files(
                                    'script', 'site', 'jam'/'jamboard') or any raw MIME type
                                    string (e.g. 'application/pdf'). Defaults to None (all types).
         detailed (bool): Whether to include size, modified time, and link in results. Defaults to True.
+        order_by (Optional[str]): Sort order. Comma-separated list of sort keys with optional 'desc' modifier.
+                                  Valid keys: 'createdTime', 'folder', 'modifiedByMeTime', 'modifiedTime',
+                                  'name', 'name_natural', 'quotaBytesUsed', 'recency', 'sharedWithMeTime',
+                                  'starred', 'viewedByMeTime'. Example: 'modifiedTime desc' or 'folder,modifiedTime desc,name'.
+                                  Defaults to None (Drive API default ordering).
 
     Returns:
         str: A formatted list of found files/folders with their details (ID, name, type, and optionally size, modified time, link).
@@ -123,6 +140,7 @@ async def search_drive_files(
         corpora=corpora,
         page_token=page_token,
         detailed=detailed,
+        order_by=order_by,
     )
 
     results = await asyncio.to_thread(service.files().list(**list_params).execute)
@@ -163,6 +181,9 @@ async def get_drive_file_content(
     • Native Google Docs, Sheets, Slides → exported as text / CSV.
     • Office files (.docx, .xlsx, .pptx) → unzipped & parsed with std-lib to
       extract readable text.
+    • PDFs → text extracted with pypdf when possible; scanned/image-only PDFs
+      fall back to a download hint.
+    • Images → returned as base64 with MIME metadata for multimodal clients.
     • Any other file → downloaded; tries UTF-8 decode, else notes binary.
 
     Args:
@@ -210,7 +231,10 @@ async def get_drive_file_content(
     }
 
     if mime_type in office_mime_types:
-        office_text = extract_office_xml_text(file_content_bytes, mime_type)
+        # Offload Office XML extraction to a thread to avoid blocking the event loop
+        office_text = await asyncio.to_thread(
+            extract_office_xml_text, file_content_bytes, mime_type
+        )
         if office_text:
             body_text = office_text
         else:
@@ -222,6 +246,19 @@ async def get_drive_file_content(
                     f"[Binary or unsupported text encoding for mimeType '{mime_type}' - "
                     f"{len(file_content_bytes)} bytes]"
                 )
+    elif mime_type == "application/pdf":
+        # Offload PDF text extraction to a thread to avoid blocking the event loop
+        pdf_text = await asyncio.to_thread(extract_pdf_text, file_content_bytes)
+        if pdf_text:
+            body_text = pdf_text
+        else:
+            body_text = (
+                f"[Could not extract text from PDF ({len(file_content_bytes)} bytes) "
+                f"- the file may be scanned/image-only. "
+                f"Use get_drive_file_download_url to get a direct download link instead.]"
+            )
+    elif mime_type in IMAGE_MIME_TYPES:
+        body_text = encode_image_content(file_content_bytes, mime_type)
     else:
         # For non-Office files (including Google native files), try UTF-8 decode directly
         try:
@@ -443,6 +480,7 @@ async def list_drive_items(
     corpora: Optional[str] = None,
     file_type: Optional[str] = None,
     detailed: bool = True,
+    order_by: Optional[str] = None,
 ) -> str:
     """
     Lists files and folders, supporting shared drives.
@@ -463,6 +501,11 @@ async def list_drive_items(
                                    'script', 'site', 'jam'/'jamboard') or any raw MIME type
                                    string (e.g. 'application/pdf'). Defaults to None (all types).
         detailed (bool): Whether to include size, modified time, and link in results. Defaults to True.
+        order_by (Optional[str]): Sort order. Comma-separated list of sort keys with optional 'desc' modifier.
+                                  Valid keys: 'createdTime', 'folder', 'modifiedByMeTime', 'modifiedTime',
+                                  'name', 'name_natural', 'quotaBytesUsed', 'recency', 'sharedWithMeTime',
+                                  'starred', 'viewedByMeTime'. Example: 'modifiedTime desc' or 'folder,modifiedTime desc,name'.
+                                  Defaults to None (Drive API default ordering).
 
     Returns:
         str: A formatted list of files/folders in the specified folder.
@@ -488,6 +531,7 @@ async def list_drive_items(
         corpora=corpora,
         page_token=page_token,
         detailed=detailed,
+        order_by=order_by,
     )
 
     results = await asyncio.to_thread(service.files().list(**list_params).execute)
