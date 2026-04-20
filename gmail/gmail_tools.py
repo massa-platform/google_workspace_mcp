@@ -1391,8 +1391,8 @@ async def get_gmail_attachment_content(
             f"Message ID: {message_id}",
             f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
             "\n⚠️ Stateless mode: File storage disabled.",
-            "\nBase64-encoded content (first 100 characters shown):",
-            f"{base64_data[:100]}...",
+            "\nBase64-encoded content:",
+            base64_data,
             "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
         ]
         logger.info(
