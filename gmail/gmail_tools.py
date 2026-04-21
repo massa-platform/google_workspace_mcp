@@ -4,6 +4,7 @@ Google Gmail MCP Tools
 This module provides MCP tools for interacting with the Gmail API.
 """
 
+import json
 import logging
 import asyncio
 import base64
@@ -1386,19 +1387,16 @@ async def get_gmail_attachment_content(
     from auth.oauth_config import is_stateless_mode
 
     if is_stateless_mode():
-        result_lines = [
-            "Attachment downloaded successfully!",
-            f"Message ID: {message_id}",
-            f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
-            "\n⚠️ Stateless mode: File storage disabled.",
-            "\nBase64-encoded content:",
-            base64_data,
-            "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
-        ]
         logger.info(
             f"[get_gmail_attachment_content] Successfully downloaded {size_kb:.1f} KB attachment (stateless mode)"
         )
-        return "\n".join(result_lines)
+        return json.dumps({
+            "type": "base64",
+            "message_id": message_id,
+            "size": size_bytes,
+            "content": base64_data,
+            "text": "Attachment downloaded successfully. File storage is disabled in stateless mode; content is base64-encoded.",
+        })
 
     # Save attachment to local disk and return file path
     try:
@@ -1461,49 +1459,40 @@ async def get_gmail_attachment_content(
             base64_data=base64_data, filename=filename, mime_type=mime_type
         )
 
-        result_lines = [
-            "Attachment downloaded successfully!",
-            f"Message ID: {message_id}",
-            f"Filename: {filename or 'unknown'}",
-            f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
-        ]
-
-        if get_transport_mode() == "stdio":
-            result_lines.append(f"\n📎 Saved to: {result.path}")
-            result_lines.append(
-                "\nThe file has been saved to disk and can be accessed directly via the file path."
-            )
-        else:
-            download_url = get_attachment_url(result.file_id)
-            result_lines.append(f"\n📎 Download URL: {download_url}")
-            result_lines.append("\nThe file will expire after 1 hour.")
-
-        result_lines.append(
-            "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch."
-        )
-
         logger.info(
             f"[get_gmail_attachment_content] Successfully saved {size_kb:.1f} KB attachment to {result.path}"
         )
-        return "\n".join(result_lines)
+
+        if get_transport_mode() == "stdio":
+            return json.dumps({
+                "type": "path",
+                "message_id": message_id,
+                "size": size_bytes,
+                "content": result.path,
+                "text": f"Attachment {filename or 'unknown'} saved to disk.",
+            })
+        else:
+            download_url = get_attachment_url(result.file_id)
+            return json.dumps({
+                "type": "url",
+                "message_id": message_id,
+                "size": size_bytes,
+                "content": download_url,
+                "text": f"Attachment {filename or 'unknown'} available for download. Link expires in 1 hour.",
+            })
 
     except Exception as e:
         logger.error(
             f"[get_gmail_attachment_content] Failed to save attachment: {e}",
             exc_info=True,
         )
-        # Fallback to showing base64 preview
-        result_lines = [
-            "Attachment downloaded successfully!",
-            f"Message ID: {message_id}",
-            f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
-            "\n⚠️ Failed to save attachment file. Showing preview instead.",
-            "\nBase64-encoded content (first 100 characters shown):",
-            f"{base64_data[:100]}...",
-            f"\nError: {str(e)}",
-            "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
-        ]
-        return "\n".join(result_lines)
+        return json.dumps({
+            "type": "base64",
+            "message_id": message_id,
+            "size": size_bytes,
+            "content": base64_data,
+            "text": f"Failed to save attachment file; returning base64 content instead. Error: {str(e)}",
+        })
 
 
 @server.tool()
