@@ -1391,11 +1391,11 @@ async def get_gmail_attachment_content(
             f"[get_gmail_attachment_content] Successfully downloaded {size_kb:.1f} KB attachment (stateless mode)"
         )
         return json.dumps({
-            "type": "base64",
+            "type": "base64url",
             "message_id": message_id,
             "size": size_bytes,
             "content": base64_data,
-            "text": "Attachment downloaded successfully. File storage is disabled in stateless mode; content is base64-encoded.",
+            "text": "Attachment downloaded successfully. File storage is disabled in stateless mode; content is base64url-encoded (RFC 4648).",
         })
 
     # Save attachment to local disk and return file path
@@ -1487,11 +1487,11 @@ async def get_gmail_attachment_content(
             exc_info=True,
         )
         return json.dumps({
-            "type": "base64",
+            "type": "base64url",
             "message_id": message_id,
             "size": size_bytes,
             "content": base64_data,
-            "text": f"Failed to save attachment file; returning base64 content instead. Error: {str(e)}",
+            "text": f"Failed to save attachment file; returning base64url-encoded content instead. Error: {str(e)}",
         })
 
 
